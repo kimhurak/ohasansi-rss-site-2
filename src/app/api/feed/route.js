@@ -1,87 +1,103 @@
 import { NextResponse } from "next/server";
-import Parser from "rss-parser";
 
-const RSS_URL = "https://rss.app/feeds/FI2njqQcPrauN4Ik.xml";
+const FEED_URL = "https://rss.app/feeds/v1.1/FI2njqOcPrauN4Ik.json";
 
-const parser = new Parser({
-  customFields: {
-    item: [
-      ["media:content", "mediaContent", { keepArray: true }],
-      ["media:thumbnail", "mediaThumbnail", { keepArray: true }],
-      ["content:encoded", "contentEncoded"],
-    ],
-  },
-});
+function pickThumbnail(item) {
+  // RSS.app JSON 포맷이 케이스가 좀 갈려서 최대한 다 커버
+  const direct =
+    item?.image ||
+    item?.image_url ||
+    item?.thumbnail ||
+    item?.thumbnail_url ||
+    item?.banner_image ||
+    item?.enclosure?.url ||
+    item?.enclosure?.link ||
+    item?.attachments?.[0]?.url ||
+    item?.attachments?.[0]?.link;
 
-function pickThumbFromItem(item) {
-  // 1) RSS 표준 enclosure
-  if (item?.enclosure?.url) return item.enclosure.url;
+  if (direct) return direct;
 
-  // 2) media:content / media:thumbnail
-  const mc = item?.mediaContent?.[0]?.$?.url;
-  if (mc) return mc;
+  const html = item?.content_html || item?.content || item?.summary || "";
+  const m = String(html).match(/<img[^>]+src=["']([^"']+)["']/i);
+  return m?.[1] || "";
+}
 
-  const mt = item?.mediaThumbnail?.[0]?.$?.url;
-  if (mt) return mt;
+function pickLink(item) {
+  return (
+    item?.url ||
+    item?.external_url ||
+    item?.link ||
+    item?.guid ||
+    item?.id ||
+    ""
+  );
+}
 
-  // 3) content / content:encoded 안에 img 찾기
-  const html = item?.contentEncoded || item?.content || "";
-  const match = html.match(/<img[^>]+src="([^"]+)"/i);
-  if (match?.[1]) return match[1];
+function pickDate(item) {
+  return (
+    item?.date_published ||
+    item?.published ||
+    item?.pubDate ||
+    item?.date ||
+    ""
+  );
+}
 
-  return "";
+function pickSnippet(item) {
+  const text =
+    item?.content_text ||
+    item?.summary ||
+    item?.description ||
+    item?.content ||
+    "";
+
+  // 너무 길면 UI가 터져서 살짝만 잘라줌
+  return String(text).replace(/\s+/g, " ").trim();
 }
 
 export async function GET() {
   try {
-    // ✅ parseURL 대신 fetch + parseString (Vercel에서 더 안정적)
-    const res = await fetch(RSS_URL, {
-      // Vercel 캐시: 5분
-      next: { revalidate: 300 },
+    const res = await fetch(FEED_URL, {
+      // Vercel에서도 안정적으로 받게
       headers: {
-        "user-agent":
-          "Mozilla/5.0 (compatible; ohasansi-rss-site/1.0; +https://vercel.app)",
-        accept: "application/rss+xml, application/xml;q=0.9, */*;q=0.8",
+        "User-Agent": "Mozilla/5.0",
+        Accept: "application/json",
       },
+      // 서버 캐시(=Vercel) 적용: 5분
+      next: { revalidate: 300 },
     });
 
     if (!res.ok) {
-      return NextResponse.json(
-        {
-          error: "RSS 불러오기 실패",
-          detail: `Status code ${res.status}`,
-        },
-        { status: 500 }
-      );
+      throw new Error(`Status code ${res.status}`);
     }
 
-    const xml = await res.text();
-    const feed = await parser.parseString(xml);
+    const feed = await res.json();
+    const rawItems = feed?.items || feed?.entries || [];
 
-    const items = (feed.items || []).slice(0, 5).map((item) => ({
-      title: item.title || "",
-      link: item.link || "",
-      pubDate: item.pubDate || item.isoDate || "",
-      contentSnippet: item.contentSnippet || "",
-      thumbnail: pickThumbFromItem(item),
-    }));
+    const items = rawItems.slice(0, 30).map((it) => {
+      const link = pickLink(it);
+      return {
+        title: it?.title || "(제목 없음)",
+        link,
+        pubDate: pickDate(it),
+        contentSnippet: pickSnippet(it),
+        thumbnail: pickThumbnail(it),
+      };
+    });
 
     return NextResponse.json(
       { items },
       {
         headers: {
-          // 프론트에서 보기 좋게
+          // CDN 캐시(서버쪽) + 백그라운드 갱신
           "Cache-Control": "s-maxage=300, stale-while-revalidate=600",
         },
       }
     );
   } catch (e) {
     return NextResponse.json(
-      {
-        error: "RSS 불러오기 실패",
-        detail: String(e?.message || e),
-      },
-      { status: 500 }
+      { error: "RSS 불러오기 실패", detail: String(e?.message || e) },
+      { status: 500, headers: { "Cache-Control": "no-store" } }
     );
   }
 }
